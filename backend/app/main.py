@@ -19,17 +19,17 @@ app = FastAPI(
 
 
 keycloak_config = KeycloakConfig(
-    client_id="fastapi-backend",
-    client_secret="T2yvJxMrOfW7QBhW1yM4WOYvMKjPBhH3",
-    server_url="http://localhost:8080",
-    realm="test",
-    open_routes=[
+    CLIENT_ID="fastapi-backend",
+    CLIENT_SECRET="T2yvJxMrOfW7QBhW1yM4WOYvMKjPBhH3",
+    SERVER_URL="http://localhost:8080",
+    REALM="test",
+    OPEN_ENDPOINTS={  # Changed from open_routes list to OPEN_ENDPOINTS set
         "/health",
         "/metrics",
         "/docs",
         "/openapi.json",
         "/redoc"
-    ]
+    }
 )
 
 @app.exception_handler(HTTPException)
@@ -45,8 +45,7 @@ app.add_exception_handler(AuthenticationError, authentication_exception_handler)
 
 app.add_middleware(
     KeycloakMiddleware,
-    config=keycloak_config,
-    token_expiry_threshold=300
+    config=keycloak_config
 )
 
 
