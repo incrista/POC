@@ -13,6 +13,7 @@ async def admin_action(
     token: Annotated[dict, Depends(RoleVerifier(ApplicationID.APP1, Role.ADMIN))],
     service: App1Service = Depends()
 ):
+    print("Hi")
     return await service.process_admin_action(token['sub'], action_request)
 
 @router.get("/admin-data")

@@ -1,7 +1,7 @@
 from fastapi import Depends, HTTPException, Request
 from typing import Annotated
 from core.auth.service import AuthorizationService, ApplicationID, Role
-from core.auth.keycloak import UserContext, AuthenticationError, AuthErrorCode
+from core.auth.keycloak import User, AuthenticationError, AuthErrorCode
 
 class RoleVerifier:
     def __init__(self, app_id: ApplicationID, required_role: Role):
@@ -9,15 +9,17 @@ class RoleVerifier:
         self.required_role = required_role
         self.auth_service = AuthorizationService()
 
-    async def __call__(self, request: Request) -> UserContext:
-        if not hasattr(request.state, "user"):
+    async def __call__(self, request: Request) -> User:
+        if not hasattr(request.scope, 'user'):
+            print(request.scope)
             raise AuthenticationError(
                 code=AuthErrorCode.MISSING_TOKEN,
                 detail="User context not found"
             )
             
-        user: UserContext = request.state.user
+        user: User = request.state.user
         app_roles = user.get_application_roles(self.app_id)
+        app_roles = self.auth_service.get_user_role()
         
         highest_role = None
         for role in app_roles:

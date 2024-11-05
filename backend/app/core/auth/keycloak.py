@@ -1,283 +1,144 @@
-from fastapi import Request, HTTPException
+from fastapi import Request
 from starlette.types import ASGIApp, Scope, Receive, Send, Message
 from starlette.responses import JSONResponse
-from pydantic import BaseModel, Field
-import httpx
+from keycloak import KeycloakOpenID
+from keycloak.exceptions import KeycloakError
 from datetime import datetime, timedelta
-from typing import Optional, Tuple, Dict, List, Set
-from enum import Enum
+from typing import Optional, Tuple, Dict, Set
 import logging
-from core.auth.service import Role, ApplicationID
+from core.auth.models import User, KeycloakConfig
 from api.errors.errors import AuthenticationError, AuthErrorCode
 
 logger = logging.getLogger(__name__)
 
-class UserContext:
-    def __init__(self, token_info: Dict):
-        self.user_id = token_info.get("sub")
-        self.username = token_info.get("preferred_username")
-        self.email = token_info.get("email")
-        self.roles = token_info.get("application-roles", [])
-        self.exp = token_info.get("exp")
-        self.client_id = token_info.get("azp")
-        self.raw_token = token_info
-
-    def get_application_roles(self, app_id: ApplicationID) -> List[Role]:
-        app_prefix = f"/Applications/{app_id}"
-        return [
-            Role(role.replace(f"{app_prefix}/", ""))
-            for role in self.roles
-            if role.startswith(app_prefix) and any(role.endswith(r.value) for r in Role)
-        ]
-    
-class User(BaseModel):
-    user_id: str
-    username: str
-    email: Optional[str]
-    roles: Set[str]
-    exp: Optional[int]
-    client_id: Optional[str]
-    disabled: bool = False
-    raw_token: Dict
-
-    def get_application_roles(self, app_id: ApplicationID) -> List[Role]:
-        app_prefix = f"/Applications/{app_id}"
-        return [
-            Role(role.replace(f"{app_prefix}/", ""))
-            for role in self.roles
-            if role.startswith(app_prefix) and any(role.endswith(r.value) for r in Role)
-        ]
-
-class KeycloakConfig(BaseModel):
-    """Keycloak authentication configuration"""
-    CLIENT_ID: str = Field(..., description="Keycloak client ID")
-    CLIENT_SECRET: str = Field(..., description="Keycloak client secret")
-    SERVER_URL: str = Field(..., description="Keycloak server URL")
-    REALM: str = Field(..., description="Keycloak realm")
-    ALGORITHM: str = "RS256"
-    TOKEN_EXPIRY_THRESHOLD: int = 300
-    OPEN_ENDPOINTS: Set[str] = {
-        "/health",
-        "/metrics",
-        "/login",
-        "/docs",
-        "/openapi.json",
-        "/redoc"
-    }
-    BYPASS_ENDPOINTS: Set[str] = {
-        "/metrics",
-        "/_internal/health"
-    }
-    introspect_url: Optional[str] = None  # Added field
-    token_url: Optional[str] = None  # Added field
-
-    def __init__(self, **data):
-        super().__init__(**data)
-        base_url = f"{self.SERVER_URL.rstrip('/')}/auth/realms/{self.REALM}/protocol/openid-connect"
-        self.introspect_url = f"{base_url}/token/introspect"
-        self.token_url = f"{base_url}/token"
-
-    class Config:
-        arbitrary_types_allowed = True
-
 class KeycloakMiddleware:
     """ASGI middleware for Keycloak authentication"""
-    def __init__(
-        self,
-        app: ASGIApp,
-        config: KeycloakConfig,
-    ):
+    
+    # Standard auth endpoints that should be open
+    AUTH_ENDPOINTS: Set[str] = {
+        "/api/login",
+        "/api/onboard",
+        "/api/token",
+        "/api/token/refresh",
+        "/api/reset",
+        "/api/logout"
+    }
+    
+    def __init__(self, app: ASGIApp, config: KeycloakConfig, keycloak_openid: KeycloakOpenID):
         self.app = app
         self.config = config
-        self.client = httpx.AsyncClient(
-            timeout=30.0,
-            headers={"Content-Type": "application/x-www-form-urlencoded"}
-        )
-
-    def is_path_open(self, path: str) -> bool:
-        """Check if path matches open endpoints, including wildcards"""
-        if path in self.config.OPEN_ENDPOINTS or path in self.config.BYPASS_ENDPOINTS:
-            return True
+        self.keycloak = keycloak_openid
         
-        for open_path in self.config.OPEN_ENDPOINTS:
-            if open_path.endswith("/*"):
-                prefix = open_path[:-1]
-                if path.startswith(prefix):
-                    return True
-        return False
-
-    async def _extract_token(self, headers: Dict[bytes, bytes]) -> Tuple[str, Optional[str]]:
-        """Extract access and refresh tokens from headers"""
-        auth_header = headers.get(b"authorization", b"").decode()
-        refresh_token = headers.get(b"x-refresh-token", b"").decode()
-
-        if not auth_header or not auth_header.startswith("Bearer "):
-            raise AuthenticationError(
-                code="missing_token",
-                detail="Authorization header missing or invalid"
-            )
-
-        return auth_header.replace("Bearer ", ""), refresh_token
-
-    async def _introspect_token(self, token: str) -> Dict:
-        """Introspect the token with Keycloak server"""
-        try:
-            payload = {
-                "token": token,
-                "client_id": self.config.CLIENT_ID,
-                "client_secret": self.config.CLIENT_SECRET,
-            }
-            
-            async with self.client as client:
-                response = await client.post(self.config.introspect_url, data=payload)
-                
-            if response.status_code != 200:
-                raise AuthenticationError(
-                    code="introspection_failed",
-                    detail="Failed to introspect token"
-                )
-
-            token_info = response.json()
-            if not token_info.get("active", False):
-                raise AuthenticationError(
-                    code="invalid_token",
-                    detail="Token is inactive or expired"
-                )
-
-            self._validate_token_claims(token_info)
-            return token_info
-            
-        except httpx.RequestError as e:
-            logger.error(f"Token introspection request failed: {str(e)}")
-            raise AuthenticationError(
-                code="introspection_failed",
-                detail="Failed to connect to authentication server"
-            )
-
-    def _validate_token_claims(self, token_info: Dict) -> None:
-        """Validate required token claims"""
-        required_claims = ["sub", "exp", "iat", "application-roles"]
-        missing_claims = [claim for claim in required_claims if claim not in token_info]
+        # Merge AUTH_ENDPOINTS with config's open endpoints
+        self.open_paths = set(config.OPEN_ENDPOINTS) | self.AUTH_ENDPOINTS
+        self.bypass_paths = set(config.BYPASS_ENDPOINTS)
+        self.wildcard_paths = {path[:-2] for path in config.OPEN_ENDPOINTS if path.endswith("/*")}
         
-        if missing_claims:
-            raise AuthenticationError(
-                code="invalid_token",
-                detail=f"Token missing required claims: {', '.join(missing_claims)}"
-            )
+        # Special handling for logout
+        self.protected_with_token = {"/api/logout"}
 
-    def _is_token_expiring(self, exp_timestamp: Optional[int]) -> bool:
-        """Check if the token is expiring soon"""
+    def is_open_path(self, path: str) -> bool:
+        """Efficiently check if path is open"""
+        return (path in self.open_paths or 
+                path in self.bypass_paths or 
+                any(path.startswith(prefix) for prefix in self.wildcard_paths))
+
+    def needs_token_validation(self, path: str) -> bool:
+        """Check if path needs token validation despite being open"""
+        return path in self.protected_with_token
+
+    async def handle_token_refresh(self, token_info: Dict, refresh_token: str) -> Optional[Tuple[str, str]]:
+        """Handle token refresh if needed"""
+        exp_timestamp = token_info.get("exp")
         if not exp_timestamp:
-            return True
+            return None
             
-        expiration_time = datetime.utcfromtimestamp(exp_timestamp)
-        current_time = datetime.utcnow()
-        return (expiration_time - current_time) < timedelta(seconds=self.config.TOKEN_EXPIRY_THRESHOLD)
+        if (datetime.utcfromtimestamp(exp_timestamp) - datetime.utcnow() 
+            < timedelta(seconds=self.config.TOKEN_EXPIRY_THRESHOLD)):
+            try:
+                token_data = await self.keycloak.refresh_token(refresh_token)
+                return token_data['access_token'], token_data.get('refresh_token')
+            except KeycloakError as e:
+                logger.warning(f"Token refresh failed: {e}")
+                return None
+        return None
 
-    async def _refresh_access_token(self, refresh_token: str) -> Tuple[str, Optional[str]]:
-        """Refresh the access token"""
+    async def validate_token(self, access_token: str) -> Dict:
+        """Validate token and return token info"""
         try:
-            payload = {
-                "grant_type": "refresh_token",
-                "refresh_token": refresh_token,
-                "client_id": self.config.CLIENT_ID,
-                "client_secret": self.config.CLIENT_SECRET,
-            }
-            
-            async with self.client as client:
-                response = await client.post(self.config.token_url, data=payload)
-                
-            if response.status_code != 200:
-                raise AuthenticationError(
-                    code="refresh_failed",
-                    detail="Failed to refresh access token"
-                )
-
-            token_data = response.json()
-            access_token = token_data.get("access_token")
-            new_refresh_token = token_data.get("refresh_token")
-
-            if not access_token:
-                raise AuthenticationError(
-                    code="refresh_failed",
-                    detail="Failed to obtain new access token"
-                )
-
-            return access_token, new_refresh_token
-            
-        except httpx.RequestError as e:
-            logger.error(f"Token refresh request failed: {str(e)}")
+            token_info = await self.keycloak.introspect(access_token)
+            if not token_info.get("active", False):
+                raise KeycloakError("Token inactive")
+            return token_info
+        except KeycloakError as e:
             raise AuthenticationError(
-                code="refresh_failed",
-                detail="Failed to connect to authentication server"
+                code=AuthErrorCode.INVALID_TOKEN,
+                detail=str(e)
             )
+
+    async def create_user_context(self, token_info: Dict) -> str:
+        """Create and serialize user context"""
+        return User(
+            user_id=token_info.get("sub"),
+            username=token_info.get("preferred_username"),
+            email=token_info.get("email"),
+            roles=set(token_info.get("application-roles", [])),
+            exp=token_info.get("exp"),
+            client_id=token_info.get("azp"),
+            raw_token=token_info
+        ).model_dump_json()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send):
         """Main middleware handler"""
-        if scope["type"] == "lifespan":
-            await self.handle_lifespan(scope, receive, send)
-            return
-            
         if scope["type"] not in ("http", "websocket"):
             await self.app(scope, receive, send)
             return
 
-        start_time = datetime.utcnow()
         path = scope.get("path", "")
         
-        # Check for bypass and open endpoints first
-        if path in self.config.BYPASS_ENDPOINTS:
+        # Skip middleware for non-auth open paths
+        if self.is_open_path(path) and not self.needs_token_validation(path):
             await self.app(scope, receive, send)
             return
 
-        if self.is_path_open(path):
-            await self.app(scope, receive, send)
-            return
+        start_time = datetime.utcnow()
+        headers = dict(scope.get("headers", []))
 
         try:
-            headers = dict(scope.get("headers", []))
-            access_token, refresh_token = await self._extract_token(headers)
-            token_info = await self._introspect_token(access_token)
+            # Extract tokens
+            auth_header = headers.get(b"authorization", b"").decode()
+            if not auth_header.startswith("Bearer "):
+                raise AuthenticationError(
+                    code=AuthErrorCode.MISSING_TOKEN,
+                    detail="Authorization header missing or invalid"
+                )
+            
+            access_token = auth_header[7:]  # Remove "Bearer " prefix
+            refresh_token = headers.get(b"x-refresh-token", b"").decode()
 
-            # Create user context
-            user = User(
-                user_id=token_info.get("sub"),
-                username=token_info.get("preferred_username"),
-                email=token_info.get("email"),
-                roles=set(token_info.get("application-roles", [])),
-                exp=token_info.get("exp"),
-                client_id=token_info.get("azp"),
-                raw_token=token_info
-            )
+            # Validate token
+            token_info = await self.validate_token(access_token)
+            
+            # Add user to scope
+            scope["user"] = await self.create_user_context(token_info)
 
-            # Add user to scope for use in dependencies
-            scope["user"] = user
-
-            # Handle token refresh if needed
-            if self._is_token_expiring(token_info.get("exp")):
-                if refresh_token:
-                    new_token, new_refresh = await self._refresh_access_token(refresh_token)
-                    
-                    # Create a wrapper for the send function to modify headers
+            # Handle token refresh
+            if refresh_token and path != "/api/token/refresh":  # Don't refresh during refresh request
+                new_tokens = await self.handle_token_refresh(token_info, refresh_token)
+                if new_tokens:
+                    new_access, new_refresh = new_tokens
                     async def send_wrapper(message: Message):
                         if message["type"] == "http.response.start":
                             headers = message.get("headers", [])
                             headers.extend([
-                                (b"X-New-Access-Token", new_token.encode()),
-                                (b"Access-Control-Expose-Headers", b"X-New-Access-Token, X-New-Refresh-Token")
+                                (b"X-New-Access-Token", new_access.encode()),
+                                (b"Access-Control-Expose-Headers", b"X-New-Access-Token, X-New-Refresh-Token"),
+                                (b"X-New-Refresh-Token", new_refresh.encode()) if new_refresh else None
                             ])
-                            if new_refresh:
-                                headers.append((b"X-New-Refresh-Token", new_refresh.encode()))
-                            message["headers"] = headers
+                            message["headers"] = [h for h in headers if h is not None]
                         await send(message)
-
                     await self.app(scope, receive, send_wrapper)
                     return
-                else:
-                    raise AuthenticationError(
-                        code="token_expired",
-                        detail="Token expired and no refresh token provided"
-                    )
 
             await self.app(scope, receive, send)
 
@@ -296,44 +157,15 @@ class KeycloakMiddleware:
             )
             await response(scope, receive, send)
         finally:
-            duration = (datetime.utcnow() - start_time).total_seconds()
-            self._log_request_metrics(scope, duration)
-            await self.client.aclose()
-    
-    async def handle_lifespan(self, scope: Scope, receive: Receive, send: Send):
-        """Handle lifespan events"""
-        try:
-            while True:
-                message = await receive()
-                if message["type"] == "lifespan.startup":
-                    # Initialize any resources if needed
-                    await send({"type": "lifespan.startup.complete"})
-                elif message["type"] == "lifespan.shutdown":
-                    # Clean up resources
-                    await self.client.aclose()
-                    await send({"type": "lifespan.shutdown.complete"})
-                    return
-        except Exception as e:
-            logger.error(f"Error in lifespan: {str(e)}", exc_info=True)
-            if message["type"] == "lifespan.startup":
-                await send({"type": "lifespan.startup.failed", "message": str(e)})
-            elif message["type"] == "lifespan.shutdown":
-                await send({"type": "lifespan.shutdown.failed", "message": str(e)})
-            return
-
-    def _log_request_metrics(self, scope: Scope, duration: float):
-        """Log request metrics for monitoring"""
-        client = scope.get("client", [None, None])
-        headers = dict(scope.get("headers", []))
-        user_agent = headers.get(b"user-agent", b"").decode()
-        
-        logger.info(
-            "Auth request metrics",
-            extra={
-                "path": scope.get("path"),
-                "method": scope.get("method"),
-                "duration": duration,
-                "client_ip": client[0],
-                "user_agent": user_agent
-            }
-        )
+            if logger.isEnabledFor(logging.INFO):
+                duration = (datetime.utcnow() - start_time).total_seconds()
+                logger.info(
+                    "Auth request metrics",
+                    extra={
+                        "path": path,
+                        "method": scope.get("method"),
+                        "duration": duration,
+                        "client_ip": scope.get("client", [None])[0],
+                        "user_agent": headers.get(b"user-agent", b"").decode()
+                    }
+                )

@@ -17,3 +17,11 @@ class AuthenticationError(HTTPException):
             detail={"code": code, "message": detail},
             headers=headers
         )
+
+class AuthorizationError(HTTPException):
+    def __init__(self, code: AuthErrorCode, detail: str, headers: Optional[Dict] = None):
+        super().__init__(
+            status_code=401,
+            detail={"code": code, "message": detail},
+            headers=headers
+        )

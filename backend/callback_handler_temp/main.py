@@ -13,8 +13,8 @@ from pathlib import Path
 class Settings(BaseSettings):
     keycloak_server_url: str = "http://localhost:8080"
     keycloak_realm: str = "test"
-    client_id: str = "fastapi-backend"
-    client_secret: str = "T2yvJxMrOfW7QBhW1yM4WOYvMKjPBhH3"
+    client_id: str = "fastapi-backend-client"
+    client_secret: str = "eymVipgkXLHlViRksmrTFmdlD5cPqG8f"
 
     class Config:
         env_prefix = "AUTH_"
@@ -280,7 +280,8 @@ async def get_introspection (request: Request):
         )
     
     token = auth_header.split(' ')[1]
-    print(token)
+    print("acc-token - ", token)
+    print("ref-token - ", refre)
     introspect_url = (
         f"{settings.keycloak_server_url}/realms/{settings.keycloak_realm}"
         f"/protocol/openid-connect/token/introspect"
