@@ -25,19 +25,3 @@ class TemporaryPasswordChange(BaseModel):
     username: str = Field(min_length=3, max_length=50)
     temporary_password: str
     new_password: str = Field(min_length=8)
-
-class AccessTokenCookie(BaseModel):
-    key: str = "access_token"
-    value: Optional[str] = None
-    max_age: int = 300 # 60 * 5
-    expires: int = 300 # 60 * 5
-    path: str = "/"
-    secure: bool = True
-    httponly: bool = True
-    samesite: str = "strict"
-    domain: str = "localhost"
-
-class RefreshTokenCookie(AccessTokenCookie):
-    key: str = "refresh_token"
-    max_age: int = 1800 # 60 * 30
-    expires: int = 1800 # 60 * 30

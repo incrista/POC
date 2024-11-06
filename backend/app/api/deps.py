@@ -2,6 +2,9 @@ from fastapi import Depends, HTTPException, Request
 from typing import Annotated
 from core.auth.service import AuthorizationService, ApplicationID, Role
 from core.auth.keycloak import User, AuthenticationError, AuthErrorCode
+from keycloak import KeycloakOpenID
+from config import keycloak_config
+from functools import lru_cache
 
 class RoleVerifier:
     def __init__(self, app_id: ApplicationID, required_role: Role):
@@ -33,3 +36,13 @@ class RoleVerifier:
             )
             
         return user
+    
+@lru_cache()
+def get_keycloak() -> KeycloakOpenID:
+    """Create and cache KeycloakOpenID instance"""
+    return KeycloakOpenID(
+            server_url=keycloak_config.SERVER_URL,
+            client_id=keycloak_config.CLIENT_ID,
+            realm_name=keycloak_config.REALM,
+            client_secret_key=keycloak_config.CLIENT_SECRET
+        )

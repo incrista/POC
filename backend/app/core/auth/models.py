@@ -42,3 +42,19 @@ class KeycloakConfig(BaseModel):
 
     class Config:
         arbitrary_types_allowed = True
+
+class AccessTokenCookie(BaseModel):
+    key: str = "access_token"
+    value: Optional[str] = None
+    max_age: int = 300 # 60 * 5
+    expires: int = 300 # 60 * 5
+    path: str = "/"
+    secure: bool = False
+    httponly: bool = False
+    samesite: str = "lax"
+    domain: str = "localhost"
+
+class RefreshTokenCookie(AccessTokenCookie):
+    key: str = "refresh_token"
+    max_age: int = 86400 # 60 * 60 * 24
+    expires: int = 86400 # 60 * 60 * 24

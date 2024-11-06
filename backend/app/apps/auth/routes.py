@@ -5,10 +5,12 @@ from fastapi.responses import RedirectResponse
 from pydantic import BaseModel, EmailStr, Field
 from keycloak import KeycloakError, KeycloakOpenID
 from fastapi.security import OAuth2PasswordBearer
-from core.auth.models import User
 from apps.auth.models import *
 from apps.auth.service import *
-from main import keycloak_openid
+from core.auth.models import *
+from core.auth.service import create_cookie
+from api.deps import get_keycloak
+from config import keycloak_openid
 from jose import JWTError
 import logging
 
@@ -38,7 +40,7 @@ state_store = {}
 #             detail="Invalid credentials"
 #         )
 
-@router.get("/api/login")
+@router.get("/login")
 async def login_redirect(request: Request):
     """Initiate OAuth2 Authorization Code flow"""
     try:
@@ -63,7 +65,7 @@ async def login_redirect(request: Request):
             detail="Failed to initiate authentication"
         )
     
-@router.get("/api/oauth-callback")
+@router.get("/oauth-callback")
 async def oauth_callback(
     code: str,
     state: str,
@@ -87,25 +89,27 @@ async def oauth_callback(
             code=code,
             redirect_uri=str(request.url_for('oauth_callback'))
         )
-        
+
         # Set access token cookie
         access_token_cookie = AccessTokenCookie(
-            value=token["access_token"],
+            value=token['access_token'],
             max_age=token.get("expires_in", 300),
-            expires=token.get("expires_in", 300)
         )
         create_cookie(response, access_token_cookie)
         
         # Set refresh token cookie
         refresh_token_cookie = RefreshTokenCookie(
-            value=token["refresh_token"]
+            value=token['refresh_token']
         )
         create_cookie(response, refresh_token_cookie)
         
-        # Redirect to frontend after successful authentication
+        # To verify cookies were set, you can check the response headers
+        logger.debug(f"Response headers: {response.headers}")
+        
         return RedirectResponse(
-            url="/dashboard",  # Replace with your frontend URL
-            status_code=status.HTTP_303_SEE_OTHER
+            url="/",
+            status_code=status.HTTP_303_SEE_OTHER,
+            headers=response.headers
         )
         
     except Exception as e:
@@ -245,11 +249,11 @@ async def oauth_callback(
 #             detail="Failed to check onboarding status"
 #         )
 
-@router.post("/api/token", response_model=TokenResponse)
-async def get_token(grant_data: GrantRequest, keycloak: KeycloakOpenID):
+@router.post("/token", response_model=TokenResponse)
+async def get_token(grant_data: GrantRequest): # keycloak: KeycloakOpenID = Depends(get_keycloak)
     """Handle token requests (useful for client credentials flow)"""
     try:
-        token = await keycloak.token(
+        token = await keycloak_openid.token(
             grant_type=["client_credentials"],
             client_id=grant_data.client_id,
             client_secret=grant_data.client_secret
@@ -266,7 +270,7 @@ async def get_token(grant_data: GrantRequest, keycloak: KeycloakOpenID):
             detail="Invalid client credentials"
         )
 
-@router.post("/api/refresh")
+@router.post("/refresh")
 async def refresh_token(request: Request, response: Response):
     """Refresh access token using refresh token from cookie"""
     try:
@@ -302,12 +306,12 @@ async def refresh_token(request: Request, response: Response):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid refresh token"
         )
-@router.post("/api/reset")
-async def reset_password(email: EmailStr, keycloak: KeycloakOpenID):
+@router.post("/reset")
+async def reset_password(email: EmailStr):
     """Handle password reset requests"""
     try:
         # Find user by email
-        users = await keycloak.admin_request(
+        users = await keycloak_openid.admin_request(
             url="/users",
             method="GET",
             params={"email": email}
@@ -320,7 +324,7 @@ async def reset_password(email: EmailStr, keycloak: KeycloakOpenID):
         user_id = users[0]["id"]
         
         # Send password reset email
-        await keycloak.admin_request(
+        await keycloak_openid.admin_request(
             url=f"/users/{user_id}/execute-actions-email",
             method="PUT",
             data=["UPDATE_PASSWORD"]
@@ -332,7 +336,7 @@ async def reset_password(email: EmailStr, keycloak: KeycloakOpenID):
         # Still return success to prevent email enumeration
         return {"message": "If the email exists, a reset link has been sent"}
 
-@router.post("/api/logout")
+@router.get("/logout")
 async def logout(request: Request, response: Response):
     """
     Logout user from both the application and Keycloak.

@@ -1,8 +1,7 @@
 from typing import Annotated
 from fastapi import APIRouter, Depends, HTTPException, status, Response, Request
-from core.auth.models import User, KeycloakConfig
-from apps.auth.models import AccessTokenCookie, RefreshTokenCookie
-from main import keycloak_openid
+from core.auth.models import *
+from config import keycloak_openid
 from fastapi.security import OAuth2PasswordBearer
 from keycloak import KeycloakError, KeycloakOpenID
 from jose import JWTError
@@ -39,16 +38,3 @@ async def get_current_user(request: Request):
             detail="Invalid token or token expired"
         )
     
-def create_cookie(response: Response, cookie_config: AccessTokenCookie) -> None:
-    """
-    Sets a cookie on the response using parameters from a Pydantic model.
-    
-    Args:
-        response (Response): The FastAPI response object
-        cookie_config (AccessTokenCookie): Pydantic model containing cookie configuration
-    """
-    # Convert the model to a dictionary and filter out None values
-    cookie_params = cookie_config.model_dump(exclude_none=True)
-    
-    # Set the cookie using the model parameters
-    response.set_cookie(**cookie_params)

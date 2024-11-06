@@ -1,9 +1,12 @@
+from fastapi import Response
 from typing import Dict, List, Optional, Tuple
 from enum import Enum
 from api.errors.errors import AuthenticationError, AuthErrorCode
-from core.auth.models import KeycloakConfig, User
+from core.auth.models import *
 import logging
 import httpx
+
+logger = logging.getLogger(__name__)
 
 class ApplicationID(str, Enum):
     APP1 = "App1"
@@ -89,3 +92,37 @@ async def refresh_access_token(config: KeycloakConfig, refresh_token: str, clien
                 code=AuthErrorCode.REFRESH_FAILED,
                 detail="Failed to connect to authentication server"
             )
+
+def create_cookie(response: Response, cookie_config: AccessTokenCookie | RefreshTokenCookie) -> None:
+    """
+    Sets a cookie on the response using parameters from a Pydantic model.
+    Maps the Pydantic model fields to FastAPI's Response.set_cookie() parameters.
+    
+    Args:
+        response (Response): The FastAPI response object
+        cookie_config (Union[AccessTokenCookie, RefreshTokenCookie]): Cookie configuration
+    """
+    try:
+        # Convert model to dict and prepare cookie parameters
+        cookie_params = cookie_config.model_dump(exclude_none=True)
+        
+        # Extract the key and value
+        key = cookie_params.pop('key')
+        value = cookie_params.pop('value')
+        
+        # Correctly map samesite parameter (FastAPI expects 'same_site')
+        # if 'samesite' in cookie_params:
+        #     cookie_params['same_site'] = cookie_params.pop('samesite')
+            
+        # Set the cookie with correct parameters
+        response.set_cookie(
+            key=key,
+            value=value,
+            **cookie_params
+        )
+        
+        logger.debug(f"Cookie '{key}' set successfully")
+        
+    except Exception as e:
+        logger.error(f"Failed to set cookie: {str(e)}")
+        raise
